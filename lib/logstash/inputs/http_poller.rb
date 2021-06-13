@@ -6,6 +6,9 @@ require "socket" # for Socket.gethostname
 require "manticore"
 require "rufus/scheduler"
 
+require_relative "value_tracking"
+require_relative "async_splitter"
+
 class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
   include LogStash::PluginMixins::HttpClient
 
@@ -29,12 +32,27 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
 
   # Define the target field for placing the received data. If this setting is omitted, the data will be stored at the root (top level) of the event.
   config :target, :validate => :string
-
+  
+  # Whether the previous run state should be preserved
+  config :clean_run, :validate => :boolean, :default => false
+  
+  # Path to file with last run time
+  config :last_run_metadata_path, :validate => :string, :default => "#{ENV['HOME']}/.logstash_http_poller_last_run"
+  
+  # Whether to save state or not in last_run_metadata_path
+  config :record_last_run, :validate => :boolean, :default => true
+  
   # If you'd like to work with the request/response metadata.
   # Set this value to the name of the field you'd like to store a nested
   # hash of metadata.
   config :metadata_target, :validate => :string, :default => '@metadata'
-
+  
+  # Provide the name of the list to be splitted
+  config :list_name, :validate => :string, :required => true
+  
+  # Check if pipeline is polled once in 24hrs
+  config :is_24hrs_poller, :validate => :boolean, :default => false
+  
   public
   Schedule_types = %w(cron every at in)
   def register
@@ -44,7 +62,11 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
 
     setup_requests!
   end
-
+  
+  def set_value_tracker(instance)
+    @value_tracker = instance
+  end
+  
   def stop
     Stud.stop!(@interval_thread) if @interval_thread
     @scheduler.stop if @scheduler
@@ -131,25 +153,47 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
 
     @scheduler = Rufus::Scheduler.new(:max_work_threads => 1)
     #as of v3.0.9, :first_in => :now doesn't work. Use the following workaround instead
-    opts = schedule_type == "every" ? { :first_in => 0.01 } : {} 
-    @scheduler.send(schedule_type, schedule_value, opts) { run_once(queue) }
+    opts = schedule_type == "every" ? {:first_in => 0.01} : {}
+    @scheduler.send(schedule_type, schedule_value, opts) { run_n_times(queue) }
     @scheduler.join
   end
-
-  def run_once(queue)
-    @requests.each do |name, request|
-      request_async(queue, name, request)
+  
+  def run_n_times(queue)
+    
+    @logger.debug? && @logger.debug("Initialize the date")
+    set_value_tracker(LogStash::Inputs::ValueTracking.build_last_value_tracker(self))
+    @startTime = Time.now
+    
+    @page = 1;
+    while (@page > 0) do
+      @logger.debug? && @logger.debug("Polling the page:", :page => @page)
+      @requests.each do |name, request|
+        request_async(queue, name, request)
+      end
+      
+      client.execute!
     end
-
-    client.execute!
+    
   end
 
   private
   def request_async(queue, name, request)
-    @logger.debug? && @logger.debug("Fetching URL", :name => name, :url => request)
+    @logger.debug? && @logger.debug("Initial HTTP URL", :name => name, :url => request)
+    
     started = Time.now
 
     method, *request_opts = request
+    url, spec = *request_opts
+    
+    headers = spec[:headers]
+    headers[:date.to_s] = @value_tracker.value.strftime("%F %T").to_s
+    headers[:pageId.to_s] = @page.to_s
+    spec[:headers] = headers
+    *request_opts = [url, spec]
+    
+    
+    @logger.debug? && @logger.debug("New HTTP URL", :name => name, :url => request)
+    
     client.async.send(method, *request_opts).
       on_success {|response| handle_success(queue, name, request, response, Time.now - started)}.
       on_failure {|exception|
@@ -171,6 +215,7 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
       event = ::LogStash::Event.new
       handle_decoded_event(queue, name, request, response, event, execution_time)
     end
+    # @value_tracker.write
   end
 
   private
@@ -183,14 +228,38 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
   def handle_decoded_event(queue, name, request, response, event, execution_time)
     apply_metadata(event, name, request, response, execution_time)
     decorate(event)
-    queue << event
+    # Logic for pagination
+    # set page=-1 to break loop if no page object or current page is the last page
+    # increment the page otherwise
+    # when at last page, save the API last run time in a file
+    if !event.get("[page]")
+      @page = -1
+    elsif event.get("[page][pageNo]") == event.get("[page][totalPages]")
+      # In case of 24hr polling, provide an extra buffer of 60 mins on the last run datetime
+      logger.debug("Date before 24 hrs polling check: ", :startTime => @startTime.to_s)
+      @startTime = (is_24hrs_poller) ? @startTime + (60 * 60) : @startTime
+      logger.debug("Date after 24 hrs polling check: ", :startTime => @startTime.to_s)
+      @value_tracker.set_value(@startTime)
+      @value_tracker.write
+      @page = -1
+    else
+      @page += 1
+    end
+    
+    
+    # Call to async splitting
+    asyncSplitter = AsyncSplitter.new
+    asyncSplitter.async.splitter(@list_name,event,queue,logger)
+    
   rescue StandardError, java.lang.Exception => e
+    # Ensure to break pagination loop when error
+    @page = -1
     @logger.error? && @logger.error("Error eventifying response!",
-                                    :exception => e,
-                                    :exception_message => e.message,
-                                    :name => name,
-                                    :url => request,
-                                    :response => response
+      :exception => e,
+      :exception_message => e.message,
+      :name => name,
+      :url => request,
+      :response => response
     )
   end
 
@@ -228,6 +297,9 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
                                       :exception_backtrace => e.backtrace,
                                       :name => name,
                                       :url => request)
+        ensure
+          # Ensure to break pagination loop when error
+          @page = -1
   end
 
   private

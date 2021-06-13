@@ -4,4 +4,6 @@ Gemfile.lock
 vendor
 *~
 .idea
+.vscode
+.github
 *.log
